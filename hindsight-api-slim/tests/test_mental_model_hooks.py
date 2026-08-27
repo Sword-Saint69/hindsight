@@ -204,3 +204,112 @@ class TestExportsAvailable:
         assert MentalModelGetContext is not None
         assert MentalModelGetResult is not None
         assert MentalModelRefreshResult is not None
+
+
+class TestMentalModelHistoryOperationValidation:
+    """Tests that get_mental_model_history invokes operation validator hooks."""
+
+    @pytest.mark.asyncio
+    async def test_get_mental_model_history_invokes_validator(self):
+        """Test get_mental_model_history calls validate_mental_model_get and rejects when disallowed."""
+        from unittest.mock import AsyncMock, MagicMock
+        from hindsight_api.engine.memory_engine import MemoryEngine
+        from hindsight_api.extensions.operation_validator import (
+            OperationValidationError,
+            OperationValidatorExtension,
+            ValidationResult,
+        )
+
+        class RejectingValidator(OperationValidatorExtension):
+            async def validate_retain(self, ctx):
+                return ValidationResult.accept()
+
+            async def validate_recall(self, ctx):
+                return ValidationResult.accept()
+
+            async def validate_reflect(self, ctx):
+                return ValidationResult.accept()
+
+            async def validate_mental_model_get(self, ctx):
+                return ValidationResult.reject("caller is not authorized for the requested bank")
+
+        validator = RejectingValidator(config={})
+        engine = MemoryEngine.__new__(MemoryEngine)
+        engine._operation_validator = validator
+        engine._authenticate_tenant = AsyncMock()
+        engine._consume_preauthorized_mental_model_operation = MagicMock(return_value=False)
+
+        request_context = MagicMock()
+
+        with pytest.raises(OperationValidationError) as exc_info:
+            await engine.get_mental_model_history("bank-1", "mm-1", request_context=request_context)
+
+        assert "caller is not authorized" in str(exc_info.value)
+        engine._authenticate_tenant.assert_awaited_once_with(request_context)
+
+    @pytest.mark.asyncio
+    async def test_get_mental_model_history_completes_post_hook(self):
+        """Test get_mental_model_history calls on_mental_model_get_complete on success."""
+        from unittest.mock import AsyncMock, MagicMock
+        from hindsight_api.engine.memory_engine import MemoryEngine
+        from hindsight_api.extensions.operation_validator import (
+            OperationValidatorExtension,
+            ValidationResult,
+        )
+
+        mock_get_complete = AsyncMock()
+
+        class AcceptingValidator(OperationValidatorExtension):
+            async def validate_retain(self, ctx):
+                return ValidationResult.accept()
+
+            async def validate_recall(self, ctx):
+                return ValidationResult.accept()
+
+            async def validate_reflect(self, ctx):
+                return ValidationResult.accept()
+
+            async def validate_mental_model_get(self, ctx):
+                return ValidationResult.accept()
+
+            async def on_mental_model_get_complete(self, result):
+                await mock_get_complete(result)
+
+        validator = AcceptingValidator(config={})
+        engine = MemoryEngine.__new__(MemoryEngine)
+        engine._operation_validator = validator
+        engine._authenticate_tenant = AsyncMock()
+        engine._consume_preauthorized_mental_model_operation = MagicMock(return_value=False)
+
+        # Mock DB backend and fetchrow / fetch
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow.return_value = {"id": "mm-1"}
+        mock_conn.fetch.return_value = [
+            {"content": '{"previous_content": "hello"}', "changed_at": "2026-08-27T00:00:00"}
+        ]
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__.return_value = mock_conn
+        mock_cm.__aexit__.return_value = None
+
+        engine._get_backend = AsyncMock()
+        
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("hindsight_api.engine.memory_engine.acquire_with_retry", lambda backend: mock_cm)
+
+            request_context = MagicMock()
+            res = await engine.get_mental_model_history("bank-1", "mm-1", request_context=request_context)
+
+            assert res == [
+                {
+                    "previous_content": "hello",
+                    "previous_reflect_response": None,
+                    "changed_at": "2026-08-27T00:00:00",
+                }
+            ]
+            mock_get_complete.assert_awaited_once()
+            call_arg = mock_get_complete.call_args[0][0]
+            assert call_arg.bank_id == "bank-1"
+            assert call_arg.mental_model_id == "mm-1"
+            assert call_arg.success is True
+

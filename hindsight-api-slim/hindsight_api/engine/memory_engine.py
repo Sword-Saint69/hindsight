@@ -13762,6 +13762,24 @@ class MemoryEngine(MemoryEngineInterface):
 
         """
         await self._authenticate_tenant(request_context)
+
+        # Pre-operation validation (credit check / usage metering)
+        if self._operation_validator:
+            from hindsight_api.extensions.operation_validator import MentalModelGetContext
+
+            if not self._consume_preauthorized_mental_model_operation(
+                bank_id,
+                mental_model_id,
+                refresh=False,
+                request_context=request_context,
+            ):
+                ctx = MentalModelGetContext(
+                    bank_id=bank_id,
+                    mental_model_id=mental_model_id,
+                    request_context=request_context,
+                )
+                await self._validate_operation(self._operation_validator.validate_mental_model_get(ctx))
+
         backend = await self._get_backend()
         async with acquire_with_retry(backend) as conn:
             exists = await conn.fetchrow(
@@ -13798,7 +13816,30 @@ class MemoryEngine(MemoryEngineInterface):
                         "changed_at": changed_at.isoformat() if hasattr(changed_at, "isoformat") else changed_at,
                     }
                 )
-            return result
+
+        # Post-operation hook (usage recording)
+        if result is not None and self._operation_validator:
+            from hindsight_api.extensions.operation_validator import MentalModelGetResult
+
+            total_content_len = sum(
+                len(item.get("previous_content") or "") + len(item.get("previous_reflect_response") or "")
+                for item in result
+            )
+            output_tokens = total_content_len // 4 if total_content_len else 0
+
+            result_ctx = MentalModelGetResult(
+                bank_id=bank_id,
+                mental_model_id=mental_model_id,
+                request_context=request_context,
+                output_tokens=output_tokens,
+                success=True,
+            )
+            try:
+                await self._operation_validator.on_mental_model_get_complete(result_ctx)
+            except Exception as hook_err:
+                logger.warning(f"Post-mental-model-get hook error (non-fatal): {hook_err}")
+
+        return result
 
     async def _generate_mental_model_embedding(self, name: str, content: str) -> str | None:
         embedding = await embedding_utils.generate_embeddings_batch(self.embeddings, [f"{name} {content}"])
