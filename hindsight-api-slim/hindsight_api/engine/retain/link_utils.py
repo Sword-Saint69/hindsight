@@ -470,13 +470,10 @@ async def create_temporal_links_batch_per_fact(
         # Build links directly from the LATERAL results (already per-unit limited)
         link_gen_start = time_mod.time()
         links = []
-        per_unit_counts: dict[str, int] = defaultdict(int)
         for row in rows:
             time_diff_h = float(row["time_diff_hours"])
             weight = max(0.3, 1.0 - (time_diff_h / time_window_hours))
-            from_id = str(row["from_id"])
-            links.append((from_id, str(row["id"]), "temporal", weight, None))
-            per_unit_counts[from_id] += 1
+            links.append((str(row["from_id"]), str(row["id"]), "temporal", weight, None))
 
         # Also compute temporal links WITHIN the new batch (new units to each other).
         # To prevent O(N^2) pair explosion and OOM on large document upserts (#3848), group new_units
@@ -489,6 +486,7 @@ async def create_temporal_links_batch_per_fact(
                     by_fact_type[f_type].append((u_id, _normalize_datetime(ev_date)))
 
             max_links = MAX_TEMPORAL_LINKS_PER_UNIT
+            within_batch_counts: dict[str, int] = defaultdict(int)
 
             for f_type, u_list in by_fact_type.items():
                 if len(u_list) < 2:
@@ -509,15 +507,15 @@ async def create_temporal_links_batch_per_fact(
 
                         weight = max(0.3, 1.0 - (time_diff_hours / time_window_hours))
 
-                        # Add forward link if u_id hasn't exceeded per-unit link budget
-                        if per_unit_counts[u_id] < max_links:
+                        # Add forward link if u_id hasn't exceeded per-unit within-batch budget
+                        if within_batch_counts[u_id] < max_links:
                             links.append((u_id, o_id, "temporal", weight, None))
-                            per_unit_counts[u_id] += 1
+                            within_batch_counts[u_id] += 1
 
-                        # Add backward link if o_id hasn't exceeded per-unit link budget
-                        if per_unit_counts[o_id] < max_links:
+                        # Add backward link if o_id hasn't exceeded per-unit within-batch budget
+                        if within_batch_counts[o_id] < max_links:
                             links.append((o_id, u_id, "temporal", weight, None))
-                            per_unit_counts[o_id] += 1
+                            within_batch_counts[o_id] += 1
 
         # Cap temporal links per unit to avoid write amplification;
         # retrieval only reads top 10-20 per unit anyway.
