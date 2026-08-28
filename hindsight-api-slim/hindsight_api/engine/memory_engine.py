@@ -13819,22 +13819,30 @@ class MemoryEngine(MemoryEngineInterface):
 
         # Post-operation hook (usage recording)
         if result is not None and self._operation_validator:
-            from hindsight_api.extensions.operation_validator import MentalModelGetResult
-
-            total_content_len = sum(
-                len(item.get("previous_content") or "") + len(item.get("previous_reflect_response") or "")
-                for item in result
-            )
-            output_tokens = total_content_len // 4 if total_content_len else 0
-
-            result_ctx = MentalModelGetResult(
-                bank_id=bank_id,
-                mental_model_id=mental_model_id,
-                request_context=request_context,
-                output_tokens=output_tokens,
-                success=True,
-            )
             try:
+                from hindsight_api.extensions.operation_validator import MentalModelGetResult
+
+                total_content_len = 0
+                for item in result:
+                    for key in ("previous_content", "previous_reflect_response"):
+                        val = item.get(key)
+                        if val is not None:
+                            if isinstance(val, str):
+                                total_content_len += len(val)
+                            elif isinstance(val, (dict, list)):
+                                total_content_len += len(json.dumps(val))
+                            else:
+                                total_content_len += len(str(val))
+
+                output_tokens = total_content_len // 4 if total_content_len else 0
+
+                result_ctx = MentalModelGetResult(
+                    bank_id=bank_id,
+                    mental_model_id=mental_model_id,
+                    request_context=request_context,
+                    output_tokens=output_tokens,
+                    success=True,
+                )
                 await self._operation_validator.on_mental_model_get_complete(result_ctx)
             except Exception as hook_err:
                 logger.warning(f"Post-mental-model-get hook error (non-fatal): {hook_err}")

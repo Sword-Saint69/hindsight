@@ -248,8 +248,9 @@ class TestMentalModelHistoryOperationValidation:
         engine._authenticate_tenant.assert_awaited_once_with(request_context)
 
     @pytest.mark.asyncio
-    async def test_get_mental_model_history_completes_post_hook(self):
-        """Test get_mental_model_history calls on_mental_model_get_complete on success."""
+    async def test_get_mental_model_history_completes_post_hook_with_structured_reflect_response(self):
+        """Test get_mental_model_history handles structured objects in previous_reflect_response and computes output_tokens accurately."""
+        import json
         from unittest.mock import AsyncMock, MagicMock
         from hindsight_api.engine.memory_engine import MemoryEngine
         from hindsight_api.extensions.operation_validator import (
@@ -281,11 +282,20 @@ class TestMentalModelHistoryOperationValidation:
         engine._authenticate_tenant = AsyncMock()
         engine._consume_preauthorized_mental_model_operation = MagicMock(return_value=False)
 
-        # Mock DB backend and fetchrow / fetch
+        previous_content = "User prefers concise Python 3.12 code."
+        previous_reflect_response = {"answer": "Detailed analysis", "confidence": 0.95, "tags": ["python", "style"]}
+        reflect_json_str = json.dumps(previous_reflect_response)
+
         mock_conn = AsyncMock()
         mock_conn.fetchrow.return_value = {"id": "mm-1"}
         mock_conn.fetch.return_value = [
-            {"content": '{"previous_content": "hello"}', "changed_at": "2026-08-27T00:00:00"}
+            {
+                "content": json.dumps({
+                    "previous_content": previous_content,
+                    "previous_reflect_response": previous_reflect_response,
+                }),
+                "changed_at": "2026-08-27T00:00:00",
+            }
         ]
 
         mock_cm = AsyncMock()
@@ -302,8 +312,8 @@ class TestMentalModelHistoryOperationValidation:
 
             assert res == [
                 {
-                    "previous_content": "hello",
-                    "previous_reflect_response": None,
+                    "previous_content": previous_content,
+                    "previous_reflect_response": previous_reflect_response,
                     "changed_at": "2026-08-27T00:00:00",
                 }
             ]
@@ -312,4 +322,127 @@ class TestMentalModelHistoryOperationValidation:
             assert call_arg.bank_id == "bank-1"
             assert call_arg.mental_model_id == "mm-1"
             assert call_arg.success is True
+
+            # Calculate expected token measurement
+            expected_total_len = len(previous_content) + len(reflect_json_str)
+            expected_tokens = expected_total_len // 4
+            assert call_arg.output_tokens == expected_tokens
+
+    @pytest.mark.asyncio
+    async def test_get_mental_model_history_preauthorized_skips_validation_but_runs_hook(self):
+        """Test preauthorized calls skip validate_mental_model_get but still record completion hook."""
+        from unittest.mock import AsyncMock, MagicMock
+        from hindsight_api.engine.memory_engine import MemoryEngine
+        from hindsight_api.extensions.operation_validator import (
+            OperationValidatorExtension,
+            ValidationResult,
+        )
+
+        mock_validate_get = AsyncMock(return_value=ValidationResult.reject("Should not be called"))
+        mock_get_complete = AsyncMock()
+
+        class PreauthorizedValidator(OperationValidatorExtension):
+            async def validate_retain(self, ctx):
+                return ValidationResult.accept()
+
+            async def validate_recall(self, ctx):
+                return ValidationResult.accept()
+
+            async def validate_reflect(self, ctx):
+                return ValidationResult.accept()
+
+            async def validate_mental_model_get(self, ctx):
+                return await mock_validate_get(ctx)
+
+            async def on_mental_model_get_complete(self, result):
+                await mock_get_complete(result)
+
+        validator = PreauthorizedValidator(config={})
+        engine = MemoryEngine.__new__(MemoryEngine)
+        engine._operation_validator = validator
+        engine._authenticate_tenant = AsyncMock()
+        # Preauthorized operation returns True
+        engine._consume_preauthorized_mental_model_operation = MagicMock(return_value=True)
+
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow.return_value = {"id": "mm-1"}
+        mock_conn.fetch.return_value = [
+            {"content": '{"previous_content": "preauth item"}', "changed_at": "2026-08-27T00:00:00"}
+        ]
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__.return_value = mock_conn
+        mock_cm.__aexit__.return_value = None
+
+        engine._get_backend = AsyncMock()
+        
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("hindsight_api.engine.memory_engine.acquire_with_retry", lambda backend: mock_cm)
+
+            request_context = MagicMock()
+            res = await engine.get_mental_model_history("bank-1", "mm-1", request_context=request_context)
+
+            assert res is not None
+            mock_validate_get.assert_not_called()
+            mock_get_complete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_get_mental_model_history_hook_error_is_non_fatal(self):
+        """Test that errors in accounting/completion hook do not raise 500 or break response."""
+        from unittest.mock import AsyncMock, MagicMock
+        from hindsight_api.engine.memory_engine import MemoryEngine
+        from hindsight_api.extensions.operation_validator import (
+            OperationValidatorExtension,
+            ValidationResult,
+        )
+
+        class FaultyHookValidator(OperationValidatorExtension):
+            async def validate_retain(self, ctx):
+                return ValidationResult.accept()
+
+            async def validate_recall(self, ctx):
+                return ValidationResult.accept()
+
+            async def validate_reflect(self, ctx):
+                return ValidationResult.accept()
+
+            async def validate_mental_model_get(self, ctx):
+                return ValidationResult.accept()
+
+            async def on_mental_model_get_complete(self, result):
+                raise RuntimeError("Hook database connection failed")
+
+        validator = FaultyHookValidator(config={})
+        engine = MemoryEngine.__new__(MemoryEngine)
+        engine._operation_validator = validator
+        engine._authenticate_tenant = AsyncMock()
+        engine._consume_preauthorized_mental_model_operation = MagicMock(return_value=False)
+
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow.return_value = {"id": "mm-1"}
+        mock_conn.fetch.return_value = [
+            {"content": '{"previous_content": "data"}', "changed_at": "2026-08-27T00:00:00"}
+        ]
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__.return_value = mock_conn
+        mock_cm.__aexit__.return_value = None
+
+        engine._get_backend = AsyncMock()
+        
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("hindsight_api.engine.memory_engine.acquire_with_retry", lambda backend: mock_cm)
+
+            request_context = MagicMock()
+            # Should NOT raise RuntimeError or 500
+            res = await engine.get_mental_model_history("bank-1", "mm-1", request_context=request_context)
+
+            assert res == [
+                {
+                    "previous_content": "data",
+                    "previous_reflect_response": None,
+                    "changed_at": "2026-08-27T00:00:00",
+                }
+            ]
+
 
