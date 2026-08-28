@@ -13764,7 +13764,7 @@ class MemoryEngine(MemoryEngineInterface):
         await self._authenticate_tenant(request_context)
 
         # Pre-operation validation (credit check / usage metering)
-        if self._operation_validator:
+        if self._operation_validator and not _nested_operation_authorized.get():
             from hindsight_api.extensions.operation_validator import MentalModelGetContext
 
             if not self._consume_preauthorized_mental_model_operation(
