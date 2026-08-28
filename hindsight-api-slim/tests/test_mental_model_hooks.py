@@ -125,7 +125,6 @@ class TestDefaultHookBehavior:
     @pytest.fixture
     def validator(self):
         """Create a concrete subclass for testing default behavior."""
-        from unittest.mock import MagicMock
 
         # Create a concrete subclass that implements the abstract methods
         class TestValidator(OperationValidatorExtension):
@@ -213,6 +212,7 @@ class TestMentalModelHistoryOperationValidation:
     async def test_get_mental_model_history_invokes_validator(self):
         """Test get_mental_model_history calls validate_mental_model_get and rejects when disallowed."""
         from unittest.mock import AsyncMock, MagicMock
+
         from hindsight_api.engine.memory_engine import MemoryEngine
         from hindsight_api.extensions.operation_validator import (
             OperationValidationError,
@@ -252,6 +252,7 @@ class TestMentalModelHistoryOperationValidation:
         """Test get_mental_model_history handles structured objects in previous_reflect_response and computes output_tokens accurately."""
         import json
         from unittest.mock import AsyncMock, MagicMock
+
         from hindsight_api.engine.memory_engine import MemoryEngine
         from hindsight_api.extensions.operation_validator import (
             OperationValidatorExtension,
@@ -290,10 +291,12 @@ class TestMentalModelHistoryOperationValidation:
         mock_conn.fetchrow.return_value = {"id": "mm-1"}
         mock_conn.fetch.return_value = [
             {
-                "content": json.dumps({
-                    "previous_content": previous_content,
-                    "previous_reflect_response": previous_reflect_response,
-                }),
+                "content": json.dumps(
+                    {
+                        "previous_content": previous_content,
+                        "previous_reflect_response": previous_reflect_response,
+                    }
+                ),
                 "changed_at": "2026-08-27T00:00:00",
             }
         ]
@@ -303,7 +306,7 @@ class TestMentalModelHistoryOperationValidation:
         mock_cm.__aexit__.return_value = None
 
         engine._get_backend = AsyncMock()
-        
+
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("hindsight_api.engine.memory_engine.acquire_with_retry", lambda backend: mock_cm)
 
@@ -332,6 +335,7 @@ class TestMentalModelHistoryOperationValidation:
     async def test_get_mental_model_history_preauthorized_skips_validation_but_runs_hook(self):
         """Test preauthorized calls skip validate_mental_model_get but still record completion hook."""
         from unittest.mock import AsyncMock, MagicMock
+
         from hindsight_api.engine.memory_engine import MemoryEngine
         from hindsight_api.extensions.operation_validator import (
             OperationValidatorExtension,
@@ -375,7 +379,7 @@ class TestMentalModelHistoryOperationValidation:
         mock_cm.__aexit__.return_value = None
 
         engine._get_backend = AsyncMock()
-        
+
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("hindsight_api.engine.memory_engine.acquire_with_retry", lambda backend: mock_cm)
 
@@ -390,6 +394,7 @@ class TestMentalModelHistoryOperationValidation:
     async def test_get_mental_model_history_hook_error_is_non_fatal(self):
         """Test that errors in accounting/completion hook do not raise 500 or break response."""
         from unittest.mock import AsyncMock, MagicMock
+
         from hindsight_api.engine.memory_engine import MemoryEngine
         from hindsight_api.extensions.operation_validator import (
             OperationValidatorExtension,
@@ -429,7 +434,7 @@ class TestMentalModelHistoryOperationValidation:
         mock_cm.__aexit__.return_value = None
 
         engine._get_backend = AsyncMock()
-        
+
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr("hindsight_api.engine.memory_engine.acquire_with_retry", lambda backend: mock_cm)
 
@@ -445,4 +450,60 @@ class TestMentalModelHistoryOperationValidation:
                 }
             ]
 
+    @pytest.mark.asyncio
+    async def test_get_mental_model_history_nested_operation_skips_validation_and_hook(self):
+        """Test that get_mental_model_history inside _authorize_nested_operations skips validation and hooks."""
+        from unittest.mock import AsyncMock, MagicMock
 
+        from hindsight_api.engine.memory_engine import MemoryEngine, _authorize_nested_operations
+        from hindsight_api.extensions.operation_validator import OperationValidatorExtension
+
+        class TrackingValidator(OperationValidatorExtension):
+            def __init__(self, config):
+                super().__init__(config)
+                self.validated = False
+                self.completed = False
+
+            async def validate_retain(self, ctx):
+                return None
+
+            async def validate_recall(self, ctx):
+                return None
+
+            async def validate_reflect(self, ctx):
+                return None
+
+            async def validate_mental_model_get(self, ctx):
+                self.validated = True
+                return None
+
+            async def on_mental_model_get_complete(self, result):
+                self.completed = True
+
+        validator = TrackingValidator(config={})
+        engine = MemoryEngine.__new__(MemoryEngine)
+        engine._operation_validator = validator
+        engine._authenticate_tenant = AsyncMock()
+
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow.return_value = {"id": "mm-1"}
+        mock_conn.fetch.return_value = [
+            {"content": '{"previous_content": "data"}', "changed_at": "2026-08-27T00:00:00"}
+        ]
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__.return_value = mock_conn
+        mock_cm.__aexit__.return_value = None
+
+        engine._get_backend = AsyncMock()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("hindsight_api.engine.memory_engine.acquire_with_retry", lambda backend: mock_cm)
+
+            request_context = MagicMock()
+            with _authorize_nested_operations():
+                res = await engine.get_mental_model_history("bank-1", "mm-1", request_context=request_context)
+
+            assert res is not None
+            assert validator.validated is False, "Nested operation should skip pre-validation"
+            assert validator.completed is False, "Nested operation should skip completion hook"

@@ -13818,7 +13818,7 @@ class MemoryEngine(MemoryEngineInterface):
                 )
 
         # Post-operation hook (usage recording)
-        if result is not None and self._operation_validator:
+        if result is not None and self._operation_validator and not _nested_operation_authorized.get():
             try:
                 from hindsight_api.extensions.operation_validator import MentalModelGetResult
 
@@ -13868,6 +13868,7 @@ class MemoryEngine(MemoryEngineInterface):
         trigger: dict[str, Any] | None,
     ) -> ResultRow:
         """Insert a pinned model using the caller's transaction.
+
         ``content`` is stored as the render of its own structure: a mental model
         created from authored markdown is on the structured schema from the
         first byte, not from its first delta refresh. Leaving the column NULL
