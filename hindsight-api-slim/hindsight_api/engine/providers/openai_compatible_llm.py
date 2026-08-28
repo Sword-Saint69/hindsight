@@ -1096,12 +1096,20 @@ class OpenAICompatibleLLM(LLMInterface):
                 if usage and getattr(usage, "completion_tokens_details", None):
                     thoughts_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", 0) or 0
                 # OpenAI-compatible providers fold reasoning tokens into
-                # ``completion_tokens`` (and thus ``total_tokens``), but the
-                # TokenUsage contract — and the Gemini provider — treat
-                # ``output_tokens``/``total_tokens`` as visible-only, surfacing
-                # reasoning separately in ``thoughts_tokens``. Subtract so the
-                # two fields don't double-count reasoning (cost over-attribution).
-                if thoughts_tokens:
+                # ``completion_tokens`` (and thus ``total_tokens``) when
+                # reasoning is included in the completion count.
+                # On gateways where reasoning tokens are reported separately,
+                # ``output_tokens`` (completion_tokens) is already visible-only,
+                # so subtracting would incorrectly clamp output to 0 (#3851).
+                #
+                # Detect folded shape: if abs((input_tokens + output_tokens) - total_tokens) < thoughts_tokens,
+                # reasoning is folded into output_tokens and must be subtracted out to avoid double counting.
+                is_folded_shape = (
+                    thoughts_tokens > 0
+                    and total_tokens > 0
+                    and abs((input_tokens + output_tokens) - total_tokens) < thoughts_tokens
+                )
+                if is_folded_shape:
                     output_tokens = max(0, output_tokens - thoughts_tokens)
                     total_tokens = max(0, total_tokens - thoughts_tokens)
 
@@ -1417,6 +1425,7 @@ class OpenAICompatibleLLM(LLMInterface):
                 usage = response.usage
                 input_tokens = usage.prompt_tokens or 0 if usage else 0
                 output_tokens = usage.completion_tokens or 0 if usage else 0
+                total_tokens = usage.total_tokens or 0 if usage else 0
                 cached_tokens = 0
                 if usage and getattr(usage, "prompt_tokens_details", None):
                     cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
@@ -1424,10 +1433,17 @@ class OpenAICompatibleLLM(LLMInterface):
                 if usage and getattr(usage, "completion_tokens_details", None):
                     thoughts_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", 0) or 0
                 # See ``call()``: OpenAI-compatible ``completion_tokens`` includes
-                # reasoning, so make ``output_tokens`` visible-only to avoid
-                # double-counting it against ``thoughts_tokens``.
-                if thoughts_tokens:
+                # reasoning only when folded (detected via abs((input + output) - total) < thoughts).
+                # Subtract only in the folded case so unfolded providers (where completion_tokens
+                # is already visible-only) don't clamp output to 0 (#3851).
+                is_folded_shape = (
+                    thoughts_tokens > 0
+                    and total_tokens > 0
+                    and abs((input_tokens + output_tokens) - total_tokens) < thoughts_tokens
+                )
+                if is_folded_shape:
                     output_tokens = max(0, output_tokens - thoughts_tokens)
+                    total_tokens = max(0, total_tokens - thoughts_tokens)
 
                 # See ``call()``: record the reasoning and cached counts too, so no
                 # billed token is dropped from the metrics counters.

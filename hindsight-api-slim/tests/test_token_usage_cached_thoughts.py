@@ -377,3 +377,71 @@ async def test_openai_compatible_metrics_account_for_every_billed_output_token()
     assert recorded["output_tokens"] == completion - reasoning  # visible-only
     assert recorded["thoughts_tokens"] == reasoning
     assert recorded["output_tokens"] + recorded["thoughts_tokens"] == completion
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_unfolded_reasoning_does_not_clamp_output_tokens():
+    """#3851: Gateways that report reasoning tokens separately from completion_tokens
+    (e.g. Gemini 3.7 Flash behind an OpenAI proxy: prompt=3110, completion=673,
+    reasoning=909, total=4692) must NOT subtract reasoning_tokens from completion_tokens.
+    Doing so incorrectly clamped output_tokens to 0 when reasoning > completion."""
+    llm = _openai_llm()
+    # Separate/unfolded shape: prompt(3110) + completion(673) + reasoning(909) == total(4692)
+    llm._client.chat.completions.create = AsyncMock(
+        return_value=_response(usage=_usage(reasoning=909, prompt=3110, completion=673, total=4692))
+    )
+    with patch("hindsight_api.engine.providers.openai_compatible_llm.get_metrics_collector"):
+        _, token_usage = await llm.call(
+            messages=[{"role": "user", "content": "Extract facts"}],
+            response_format=_OkModel,
+            max_retries=0,
+            return_usage=True,
+        )
+    # Output tokens must remain 673, NOT clamped to 0
+    assert token_usage.output_tokens == 673
+    assert token_usage.thoughts_tokens == 909
+    assert token_usage.input_tokens == 3110
+    assert token_usage.total_tokens == 4692
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_with_tools_unfolded_reasoning_does_not_clamp_output_tokens():
+    """#3851: Streaming / tool call path must also preserve output_tokens on unfolded responses."""
+    llm = _openai_llm()
+    llm._client.chat.completions.create = AsyncMock(
+        return_value=_response(usage=_usage(reasoning=909, prompt=3110, completion=673, total=4692), content="done")
+    )
+    collector = MagicMock(spec=MetricsCollector)
+    with patch(
+        "hindsight_api.engine.providers.openai_compatible_llm.get_metrics_collector",
+        return_value=collector,
+    ):
+        result = await llm.call_with_tools(messages=[{"role": "user", "content": "hi"}], tools=[], max_retries=0)
+
+    assert result.output_tokens == 673
+    assert result.thoughts_tokens == 909
+    recorded = _recorded_llm_call(collector)
+    assert recorded["output_tokens"] == 673
+    assert recorded["thoughts_tokens"] == 909
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_call_folded_reasoning_with_minor_proxy_token_variance():
+    """#3851 edge case: Folded response with 1-token proxy total_tokens variance
+    (prompt=3340, completion=1337 [containing 48 reasoning], total=4678 instead of 4677)
+    is still detected as folded because abs((3340+1337) - 4678) = 1 < 48."""
+    llm = _openai_llm()
+    llm._client.chat.completions.create = AsyncMock(
+        return_value=_response(usage=_usage(reasoning=48, prompt=3340, completion=1337, total=4678))
+    )
+    with patch("hindsight_api.engine.providers.openai_compatible_llm.get_metrics_collector"):
+        _, token_usage = await llm.call(
+            messages=[{"role": "user", "content": "Query"}],
+            response_format=_OkModel,
+            max_retries=0,
+            return_usage=True,
+        )
+    assert token_usage.output_tokens == 1337 - 48
+    assert token_usage.thoughts_tokens == 48
+
+
