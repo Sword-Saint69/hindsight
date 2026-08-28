@@ -477,8 +477,8 @@ async def create_temporal_links_batch_per_fact(
 
         # Also compute temporal links WITHIN the new batch (new units to each other).
         # To prevent O(N^2) pair explosion and OOM on large document upserts (#3848), group new_units
-        # by fact_type, sort chronologically by event_date_norm, and use a sliding window with
-        # inline per-unit link bounds.
+        # by fact_type, sort chronologically by event_date_norm, and use a sliding window over
+        # the nearest K future units (collecting up to K successors and K predecessors per unit).
         if len(new_units) > 1:
             by_fact_type: dict[str, list[tuple[str, datetime]]] = defaultdict(list)
             for u_id, (ev_date, f_type) in new_units.items():
@@ -486,7 +486,6 @@ async def create_temporal_links_batch_per_fact(
                     by_fact_type[f_type].append((u_id, _normalize_datetime(ev_date)))
 
             max_links = MAX_TEMPORAL_LINKS_PER_UNIT
-            within_batch_counts: dict[str, int] = defaultdict(int)
 
             for f_type, u_list in by_fact_type.items():
                 if len(u_list) < 2:
@@ -507,15 +506,12 @@ async def create_temporal_links_batch_per_fact(
 
                         weight = max(0.3, 1.0 - (time_diff_hours / time_window_hours))
 
-                        # Add forward link if u_id hasn't exceeded per-unit within-batch budget
-                        if within_batch_counts[u_id] < max_links:
-                            links.append((u_id, o_id, "temporal", weight, None))
-                            within_batch_counts[u_id] += 1
-
-                        # Add backward link if o_id hasn't exceeded per-unit within-batch budget
-                        if within_batch_counts[o_id] < max_links:
-                            links.append((o_id, u_id, "temporal", weight, None))
-                            within_batch_counts[o_id] += 1
+                        # Collect candidate forward link (u_id -> o_id) and backward link (o_id -> u_id).
+                        # Each unit inspects up to max_links future neighbors, contributing at most
+                        # max_links successor candidates and max_links predecessor candidates per unit,
+                        # bounding candidate generation to O(N*K) without pre-suppressing directions (#3848).
+                        links.append((u_id, o_id, "temporal", weight, None))
+                        links.append((o_id, u_id, "temporal", weight, None))
 
         # Cap temporal links per unit to avoid write amplification;
         # retrieval only reads top 10-20 per unit anyway.
