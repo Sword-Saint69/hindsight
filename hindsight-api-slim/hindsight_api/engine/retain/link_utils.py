@@ -5,8 +5,9 @@ Link creation utilities for temporal, semantic, and entity links.
 import logging
 import re
 import time
+from collections import defaultdict
 from collections.abc import Sequence
-from datetime import UTC
+from datetime import UTC, datetime
 
 from ..._vector_index import ann_search_tuning_settings, configured_vector_extension
 from ..causal_links import (
@@ -469,36 +470,54 @@ async def create_temporal_links_batch_per_fact(
         # Build links directly from the LATERAL results (already per-unit limited)
         link_gen_start = time_mod.time()
         links = []
+        per_unit_counts: dict[str, int] = defaultdict(int)
         for row in rows:
             time_diff_h = float(row["time_diff_hours"])
             weight = max(0.3, 1.0 - (time_diff_h / time_window_hours))
-            links.append((row["from_id"], str(row["id"]), "temporal", weight, None))
+            from_id = str(row["from_id"])
+            links.append((from_id, str(row["id"]), "temporal", weight, None))
+            per_unit_counts[from_id] += 1
 
-        # Also compute temporal links WITHIN the new batch (new units to each other)
+        # Also compute temporal links WITHIN the new batch (new units to each other).
+        # To prevent O(N^2) pair explosion and OOM on large document upserts (#3848), group new_units
+        # by fact_type, sort chronologically by event_date_norm, and use a sliding window with
+        # inline per-unit link bounds.
         if len(new_units) > 1:
-            # Convert new_units dict to candidate format for within-batch linking
-            new_unit_items = list(new_units.items())
-            for i, (unit_id, (event_date, fact_type)) in enumerate(new_unit_items):
-                if event_date is None:
-                    continue  # Skip units without event_date for temporal linking
-                unit_event_date_norm = _normalize_datetime(event_date)
+            by_fact_type: dict[str, list[tuple[str, datetime]]] = defaultdict(list)
+            for u_id, (ev_date, f_type) in new_units.items():
+                if ev_date is not None and f_type:
+                    by_fact_type[f_type].append((u_id, _normalize_datetime(ev_date)))
 
-                # Compare with other new units (only those after this one to avoid duplicates)
-                for j in range(i + 1, len(new_unit_items)):
-                    other_id, (other_event_date, other_fact_type) = new_unit_items[j]
-                    if other_event_date is None:
-                        continue  # Skip units without event_date
-                    if fact_type != other_fact_type:
-                        continue  # Only link facts of the same type
-                    other_event_date_norm = _normalize_datetime(other_event_date)
+            max_links = MAX_TEMPORAL_LINKS_PER_UNIT
 
-                    # Check if within time window
-                    time_diff_hours = abs((unit_event_date_norm - other_event_date_norm).total_seconds() / 3600)
-                    if time_diff_hours <= time_window_hours:
+            for f_type, u_list in by_fact_type.items():
+                if len(u_list) < 2:
+                    continue
+                # Sort units chronologically by event_date_norm
+                u_list.sort(key=lambda item: item[1])
+
+                n = len(u_list)
+                for i in range(n):
+                    u_id, u_date = u_list[i]
+                    # Since u_list is sorted by event_date, top-N nearest future neighbors in time
+                    # are within the next max_links elements.
+                    for j in range(i + 1, min(n, i + 1 + max_links)):
+                        o_id, o_date = u_list[j]
+                        time_diff_hours = (o_date - u_date).total_seconds() / 3600.0
+                        if time_diff_hours > time_window_hours:
+                            break
+
                         weight = max(0.3, 1.0 - (time_diff_hours / time_window_hours))
-                        # Create bidirectional links
-                        links.append((unit_id, other_id, "temporal", weight, None))
-                        links.append((other_id, unit_id, "temporal", weight, None))
+
+                        # Add forward link if u_id hasn't exceeded per-unit link budget
+                        if per_unit_counts[u_id] < max_links:
+                            links.append((u_id, o_id, "temporal", weight, None))
+                            per_unit_counts[u_id] += 1
+
+                        # Add backward link if o_id hasn't exceeded per-unit link budget
+                        if per_unit_counts[o_id] < max_links:
+                            links.append((o_id, u_id, "temporal", weight, None))
+                            per_unit_counts[o_id] += 1
 
         # Cap temporal links per unit to avoid write amplification;
         # retrieval only reads top 10-20 per unit anyway.
