@@ -1104,14 +1104,17 @@ class OpenAICompatibleLLM(LLMInterface):
                 #
                 # Detect folded shape: if abs((input_tokens + output_tokens) - total_tokens) < thoughts_tokens,
                 # reasoning is folded into output_tokens and must be subtracted out to avoid double counting.
-                is_folded_shape = (
-                    thoughts_tokens > 0
-                    and total_tokens > 0
-                    and abs((input_tokens + output_tokens) - total_tokens) < thoughts_tokens
+                # Detect folded shape: if reasoning tokens are present, check if completion_tokens
+                # includes reasoning tokens (folded). If total_tokens is omitted/0, default to folded shape.
+                is_folded_shape = thoughts_tokens > 0 and (
+                    total_tokens <= 0 or abs((input_tokens + output_tokens) - total_tokens) < thoughts_tokens
                 )
                 if is_folded_shape:
                     output_tokens = max(0, output_tokens - thoughts_tokens)
-                    total_tokens = max(0, total_tokens - thoughts_tokens)
+
+                # TokenUsage contract specifies total_tokens = input_tokens + output_tokens
+                # (visible-only total, excluding thoughts_tokens).
+                total_tokens = input_tokens + output_tokens
 
                 # Record LLM metrics. ``output_tokens`` is visible-only by now, so
                 # ``thoughts_tokens`` has to be recorded alongside it or the reasoning
@@ -1436,14 +1439,11 @@ class OpenAICompatibleLLM(LLMInterface):
                 # reasoning only when folded (detected via abs((input + output) - total) < thoughts).
                 # Subtract only in the folded case so unfolded providers (where completion_tokens
                 # is already visible-only) don't clamp output to 0 (#3851).
-                is_folded_shape = (
-                    thoughts_tokens > 0
-                    and total_tokens > 0
-                    and abs((input_tokens + output_tokens) - total_tokens) < thoughts_tokens
+                is_folded_shape = thoughts_tokens > 0 and (
+                    total_tokens <= 0 or abs((input_tokens + output_tokens) - total_tokens) < thoughts_tokens
                 )
                 if is_folded_shape:
                     output_tokens = max(0, output_tokens - thoughts_tokens)
-                    total_tokens = max(0, total_tokens - thoughts_tokens)
 
                 # See ``call()``: record the reasoning and cached counts too, so no
                 # billed token is dropped from the metrics counters.

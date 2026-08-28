@@ -401,7 +401,8 @@ async def test_openai_compatible_call_unfolded_reasoning_does_not_clamp_output_t
     assert token_usage.output_tokens == 673
     assert token_usage.thoughts_tokens == 909
     assert token_usage.input_tokens == 3110
-    assert token_usage.total_tokens == 4692
+    # TokenUsage contract: total_tokens = input_tokens + output_tokens (excludes thoughts)
+    assert token_usage.total_tokens == 3110 + 673
 
 
 @pytest.mark.asyncio
@@ -445,3 +446,20 @@ async def test_openai_compatible_call_folded_reasoning_with_minor_proxy_token_va
     assert token_usage.thoughts_tokens == 48
 
 
+@pytest.mark.asyncio
+async def test_openai_compatible_call_missing_total_tokens_defaults_to_folded():
+    """#3851 edge case: When total_tokens is missing or 0 from a proxy, default to folded shape."""
+    llm = _openai_llm()
+    llm._client.chat.completions.create = AsyncMock(
+        return_value=_response(usage=_usage(reasoning=64, prompt=20, completion=83, total=0))
+    )
+    with patch("hindsight_api.engine.providers.openai_compatible_llm.get_metrics_collector"):
+        _, token_usage = await llm.call(
+            messages=[{"role": "user", "content": "Query"}],
+            response_format=_OkModel,
+            max_retries=0,
+            return_usage=True,
+        )
+    assert token_usage.output_tokens == 83 - 64
+    assert token_usage.thoughts_tokens == 64
+    assert token_usage.total_tokens == 20 + (83 - 64)
