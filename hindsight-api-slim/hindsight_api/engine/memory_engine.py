@@ -13830,7 +13830,7 @@ class MemoryEngine(MemoryEngineInterface):
                             if isinstance(val, str):
                                 total_content_len += len(val)
                             elif isinstance(val, (dict, list)):
-                                total_content_len += len(json.dumps(val))
+                                total_content_len += len(json.dumps(val, default=str))
                             else:
                                 total_content_len += len(str(val))
 
@@ -13868,7 +13868,6 @@ class MemoryEngine(MemoryEngineInterface):
         trigger: dict[str, Any] | None,
     ) -> ResultRow:
         """Insert a pinned model using the caller's transaction.
-
         ``content`` is stored as the render of its own structure: a mental model
         created from authored markdown is on the structured schema from the
         first byte, not from its first delta refresh. Leaving the column NULL
