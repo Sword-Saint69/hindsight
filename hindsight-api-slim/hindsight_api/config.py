@@ -406,6 +406,13 @@ ENV_EMBEDDINGS_OPENAI_BASE_URL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"
 ENV_EMBEDDINGS_OPENAI_BATCH_SIZE = "HINDSIGHT_API_EMBEDDINGS_OPENAI_BATCH_SIZE"
 ENV_EMBEDDINGS_OPENAI_DIMENSIONS = "HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS"
 
+# Retry/backoff for remote embedding APIs. Recall embeds its query inline on the
+# request path, so a single upstream 5xx must not surface as a user-visible 500.
+ENV_EMBEDDINGS_MAX_RETRIES = "HINDSIGHT_API_EMBEDDINGS_MAX_RETRIES"
+ENV_EMBEDDINGS_INITIAL_BACKOFF = "HINDSIGHT_API_EMBEDDINGS_INITIAL_BACKOFF"
+ENV_EMBEDDINGS_MAX_BACKOFF = "HINDSIGHT_API_EMBEDDINGS_MAX_BACKOFF"
+ENV_EMBEDDINGS_RETRY_BUDGET = "HINDSIGHT_API_EMBEDDINGS_RETRY_BUDGET"
+
 # Gemini/Vertex AI embeddings configuration
 ENV_EMBEDDINGS_GEMINI_API_KEY = "HINDSIGHT_API_EMBEDDINGS_GEMINI_API_KEY"
 ENV_EMBEDDINGS_GEMINI_MODEL = "HINDSIGHT_API_EMBEDDINGS_GEMINI_MODEL"
@@ -539,6 +546,7 @@ ENV_ANN_MAX_SCAN_TUPLES = "HINDSIGHT_API_ANN_MAX_SCAN_TUPLES"
 ENV_TEXT_SEARCH_EXTENSION = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION"
 ENV_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE"
 ENV_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER"
+ENV_TEXT_SEARCH_EXTENSION_PG_SEARCH_FUNCTION_SCHEMA = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_FUNCTION_SCHEMA"
 ENV_LLM_OUTPUT_LANGUAGE = "HINDSIGHT_API_LLM_OUTPUT_LANGUAGE"
 ENV_QUERY_ANALYZER_LANGUAGES = "HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES"
 
@@ -806,6 +814,7 @@ ENV_WORKER_CONSOLIDATION_BANK_PRIORITY = "HINDSIGHT_API_WORKER_CONSOLIDATION_BAN
 ENV_RETAIN_MAX_CONCURRENT = "HINDSIGHT_API_RETAIN_MAX_CONCURRENT"
 ENV_RETAIN_SUBBATCH_CONCURRENCY = "HINDSIGHT_API_RETAIN_SUBBATCH_CONCURRENCY"
 ENV_RETAIN_WALL_TIMEOUT = "HINDSIGHT_API_RETAIN_WALL_TIMEOUT"
+ENV_CONSOLIDATION_WALL_TIMEOUT = "HINDSIGHT_API_CONSOLIDATION_WALL_TIMEOUT"
 
 # Reflect agent settings
 ENV_REFLECT_MAX_ITERATIONS = "HINDSIGHT_API_REFLECT_MAX_ITERATIONS"
@@ -997,6 +1006,13 @@ DEFAULT_EMBEDDINGS_OPENAI_BATCH_SIZE = 100
 # coalesces its per-chunk embedding calls up to (see embedding_coalescer), so raising
 # it is how a TEI deployment with headroom trades requests for larger ones.
 DEFAULT_EMBEDDINGS_TEI_BATCH_SIZE = 32
+# Embedding retry defaults: 4 retries (5 attempts total) with 0.5s -> 4s exponential
+# backoff, plus a 15s ceiling on the time any single encode() call may spend retrying
+# so a synchronous recall degrades to a slow response instead of a long stall.
+DEFAULT_EMBEDDINGS_MAX_RETRIES = 4
+DEFAULT_EMBEDDINGS_INITIAL_BACKOFF = 0.5
+DEFAULT_EMBEDDINGS_MAX_BACKOFF = 4.0
+DEFAULT_EMBEDDINGS_RETRY_BUDGET = 15.0
 DEFAULT_EMBEDDINGS_GEMINI_MODEL = "gemini-embedding-001"
 DEFAULT_EMBEDDINGS_GEMINI_OUTPUT_DIMENSIONALITY = 768
 DEFAULT_EMBEDDINGS_GEMINI_FORCE_IPV4 = False
@@ -1185,6 +1201,7 @@ DEFAULT_TEXT_SEARCH_EXTENSION = "native"  # Options: "native", "vchord", "pg_tex
 # pgroonga: TokenBigram polyglot, pg_search: per-field Tantivy tokenizer).
 DEFAULT_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE = "english"
 DEFAULT_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER = ""
+DEFAULT_TEXT_SEARCH_EXTENSION_PG_SEARCH_FUNCTION_SCHEMA = "paradedb"
 
 # LiteLLM defaults
 DEFAULT_LITELLM_API_BASE = "http://localhost:4000"
@@ -1437,6 +1454,13 @@ DEFAULT_RETAIN_SUBBATCH_CONCURRENCY = 1
 # genuine wedge — the per-attempt LLM timeout and the retry budget already bound
 # the normal slow path.
 DEFAULT_RETAIN_WALL_TIMEOUT = 3600  # seconds (1 hour)
+# Ceiling on how long one consolidation task may run *without making progress*
+# (0 disables). Unlike retain's ceiling this is an idle timeout, not a cap on total
+# runtime: consolidation is a loop over batches that each commit their own memories,
+# and every committed batch restarts the clock. A bank with a large backlog is
+# therefore never cut short — only a job that has genuinely stalled is. The default
+# is still longer than retain's because a single batch is LLM-heavy.
+DEFAULT_CONSOLIDATION_WALL_TIMEOUT = 7200  # seconds (2 hours)
 
 # Reflect agent settings
 DEFAULT_REFLECT_MAX_ITERATIONS = 10  # Max tool call iterations before forcing response
@@ -1729,6 +1753,19 @@ def _parse_optional_non_negative_int(name: str, raw: str | None) -> int | None:
         parsed = int(raw)
     except ValueError as e:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from e
+    if parsed < 0:
+        raise ValueError(f"{name} must be >= 0, got {parsed}")
+    return parsed
+
+
+def _parse_non_negative_float(name: str, raw: str | None, default: float) -> float:
+    """Parse an env var that must be a non-negative number of seconds (>= 0)."""
+    if raw is None or raw == "":
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError as e:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from e
     if parsed < 0:
         raise ValueError(f"{name} must be >= 0, got {parsed}")
     return parsed
@@ -2285,6 +2322,9 @@ class HindsightConfig:
     # ParadeDB pg_search tokenizer used when building BM25 indexes. Empty keeps
     # ParadeDB's default tokenizer.
     text_search_extension_pg_search_tokenizer: str
+    # ParadeDB pg_search function schema (default: "paradedb", e.g. "pgsearch"
+    # for certain managed PostgreSQL distributions).
+    text_search_extension_pg_search_function_schema: str
     # Restrict dateparser's language detection in the recall temporal analyzer
     # (comma-separated ISO codes, e.g. "en" or "en,zh"). Empty keeps full
     # auto-detection across all 200+ locales. Restricting is much faster and
@@ -2727,6 +2767,7 @@ class HindsightConfig:
     retain_max_concurrent: int
     retain_subbatch_concurrency: int
     retain_wall_timeout: int
+    consolidation_wall_timeout: int
 
     # Reflect agent settings
     reflect_max_iterations: int
@@ -2852,6 +2893,12 @@ class HindsightConfig:
     retention_sweep_interval_seconds: int = DEFAULT_RETENTION_SWEEP_INTERVAL_SECONDS
     operation_cleanup_interval_seconds: int = DEFAULT_OPERATION_CLEANUP_INTERVAL_SECONDS
     maintenance_start_jitter_seconds: int = DEFAULT_MAINTENANCE_START_JITTER_SECONDS
+
+    # Retry/backoff applied to remote embedding API calls (see EmbeddingRetryPolicy).
+    embeddings_max_retries: int = DEFAULT_EMBEDDINGS_MAX_RETRIES
+    embeddings_initial_backoff: float = DEFAULT_EMBEDDINGS_INITIAL_BACKOFF
+    embeddings_max_backoff: float = DEFAULT_EMBEDDINGS_MAX_BACKOFF
+    embeddings_retry_budget: float = DEFAULT_EMBEDDINGS_RETRY_BUDGET
 
     # Class-level sets for configuration categorization
 
@@ -3155,6 +3202,24 @@ class HindsightConfig:
                 f"'french', 'simple', 'zhparser'."
             )
 
+        # Validate text_search_extension_pg_search_function_schema as a PG identifier.
+        # Embedded directly into raw SQL via <schema>.score(...) etc., so we
+        # reject anything that isn't a plain identifier to prevent injection.
+        # Empty/whitespace values fall back to the default ("paradedb").
+        schema = (self.text_search_extension_pg_search_function_schema or "").strip().lower()
+        if not schema:
+            self.text_search_extension_pg_search_function_schema = (
+                DEFAULT_TEXT_SEARCH_EXTENSION_PG_SEARCH_FUNCTION_SCHEMA
+            )
+        elif not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", schema):
+            raise ValueError(
+                f"Invalid text_search_extension_pg_search_function_schema: "
+                f"{self.text_search_extension_pg_search_function_schema!r}. Must be a valid PostgreSQL identifier "
+                f"(letters, digits, underscores; not starting with a digit). Examples: 'paradedb', 'pgsearch'."
+            )
+        else:
+            self.text_search_extension_pg_search_function_schema = schema
+
         self.text_search_extension_pg_search_tokenizer = normalize_pg_search_tokenizer(
             self.text_search_extension_pg_search_tokenizer
         )
@@ -3300,6 +3365,10 @@ class HindsightConfig:
             text_search_extension_pg_search_tokenizer=os.getenv(
                 ENV_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER,
                 DEFAULT_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER,
+            ),
+            text_search_extension_pg_search_function_schema=os.getenv(
+                ENV_TEXT_SEARCH_EXTENSION_PG_SEARCH_FUNCTION_SCHEMA,
+                DEFAULT_TEXT_SEARCH_EXTENSION_PG_SEARCH_FUNCTION_SCHEMA,
             ),
             query_analyzer_languages=(
                 [code.strip().lower() for code in raw.split(",") if code.strip()] or None
@@ -3548,6 +3617,26 @@ class HindsightConfig:
             ),
             embeddings_query_prefix=os.getenv(ENV_EMBEDDINGS_QUERY_PREFIX, DEFAULT_EMBEDDINGS_QUERY_PREFIX),
             embeddings_passage_prefix=os.getenv(ENV_EMBEDDINGS_PASSAGE_PREFIX, DEFAULT_EMBEDDINGS_PASSAGE_PREFIX),
+            embeddings_max_retries=_parse_non_negative_int(
+                ENV_EMBEDDINGS_MAX_RETRIES,
+                os.getenv(ENV_EMBEDDINGS_MAX_RETRIES),
+                DEFAULT_EMBEDDINGS_MAX_RETRIES,
+            ),
+            embeddings_initial_backoff=_parse_non_negative_float(
+                ENV_EMBEDDINGS_INITIAL_BACKOFF,
+                os.getenv(ENV_EMBEDDINGS_INITIAL_BACKOFF),
+                DEFAULT_EMBEDDINGS_INITIAL_BACKOFF,
+            ),
+            embeddings_max_backoff=_parse_non_negative_float(
+                ENV_EMBEDDINGS_MAX_BACKOFF,
+                os.getenv(ENV_EMBEDDINGS_MAX_BACKOFF),
+                DEFAULT_EMBEDDINGS_MAX_BACKOFF,
+            ),
+            embeddings_retry_budget=_parse_non_negative_float(
+                ENV_EMBEDDINGS_RETRY_BUDGET,
+                os.getenv(ENV_EMBEDDINGS_RETRY_BUDGET),
+                DEFAULT_EMBEDDINGS_RETRY_BUDGET,
+            ),
             # Cohere embeddings (with backward-compatible fallback to shared API key)
             embeddings_cohere_api_key=os.getenv(ENV_EMBEDDINGS_COHERE_API_KEY) or os.getenv(ENV_COHERE_API_KEY),
             embeddings_cohere_model=os.getenv(ENV_EMBEDDINGS_COHERE_MODEL, DEFAULT_EMBEDDINGS_COHERE_MODEL),
@@ -4063,6 +4152,9 @@ class HindsightConfig:
                 os.getenv(ENV_RETAIN_SUBBATCH_CONCURRENCY, str(DEFAULT_RETAIN_SUBBATCH_CONCURRENCY))
             ),
             retain_wall_timeout=int(os.getenv(ENV_RETAIN_WALL_TIMEOUT, str(DEFAULT_RETAIN_WALL_TIMEOUT))),
+            consolidation_wall_timeout=int(
+                os.getenv(ENV_CONSOLIDATION_WALL_TIMEOUT, str(DEFAULT_CONSOLIDATION_WALL_TIMEOUT))
+            ),
             # Reflect agent settings
             reflect_max_iterations=int(os.getenv(ENV_REFLECT_MAX_ITERATIONS, str(DEFAULT_REFLECT_MAX_ITERATIONS))),
             reflect_prompt_cache_enabled=os.getenv(

@@ -169,6 +169,7 @@ def FieldWithDefault(default_factory: Callable, **kwargs) -> Any:
 from hindsight_api.config import HindsightConfig, StaticConfigProxy, get_config
 from hindsight_api.engine.interface import BankTemplateImportWrite
 from hindsight_api.engine.memory_engine import (
+    KEEP_PARENT,
     Budget,
     RetainOperationConflictError,
     _current_schema,
@@ -198,6 +199,7 @@ from hindsight_api.metrics import (
     get_metrics_collector,
     initialize_metrics,
     normalize_http_endpoint,
+    reset_metrics_collector,
 )
 from hindsight_api.models import RequestContext
 
@@ -3075,7 +3077,9 @@ async def apply_bank_template_manifest(
     # ones past the first page, and the import would create duplicates.
     existing_by_id: dict[str, dict[str, Any]] = {}
     if bank_exists and manifest.mental_models:
-        existing = await memory.list_mental_models(bank_id=bank_id, limit=None, request_context=request_context)
+        existing = await memory.list_mental_models(
+            bank_id=bank_id, limit=None, detail="metadata", request_context=request_context
+        )
         existing_by_id = {m["id"]: m for m in existing.items}
 
     existing_by_name: dict[str, dict[str, Any]] = {}
@@ -3128,6 +3132,7 @@ async def apply_bank_template_manifest(
             provisioned = await memory.list_mental_models(
                 bank_id=bank_id,
                 limit=None,
+                detail="metadata",
                 request_context=request_context,
             )
             provisioned_by_id = {item["id"]: item for item in provisioned.items}
@@ -3173,7 +3178,9 @@ async def apply_default_bank_template_resources(
     """Apply only the resources from a server-owned default template."""
     existing_by_id: dict[str, dict[str, Any]] = {}
     if manifest.mental_models:
-        existing = await memory.list_mental_models(bank_id=bank_id, limit=None, request_context=request_context)
+        existing = await memory.list_mental_models(
+            bank_id=bank_id, limit=None, detail="metadata", request_context=request_context
+        )
         existing_by_id = {model["id"]: model for model in existing.items}
 
     existing_by_name: dict[str, dict[str, Any]] = {}
@@ -3870,7 +3877,11 @@ def create_app(
         poller_task = None
         loop_watchdog = None
 
-        # Initialize OpenTelemetry metrics
+        # Initialize OpenTelemetry metrics. Remember the collector we displace so
+        # shutdown can put it back: the collector is a module global, so an app
+        # that starts and stops otherwise leaves its own collector — holding a
+        # closed DB pool — installed for the rest of the process (#3780).
+        previous_metrics_collector = get_metrics_collector()
         try:
             prometheus_reader = initialize_metrics(service_name="hindsight-api", service_version="1.0.0")
             create_metrics_collector()
@@ -3926,6 +3937,7 @@ def create_app(
                 max_slots=config.worker_max_slots,
                 slot_reservations=config.worker_slot_reservations,
                 consolidation_bank_priority=config.worker_consolidation_bank_priority or None,
+                on_wall_timeout=memory.on_task_wall_timeout,
             )
             poller_task = asyncio.create_task(poller.run())
             logging.info(f"Worker poller started (worker_id={worker_id})")
@@ -3981,6 +3993,9 @@ def create_app(
         from hindsight_api.tracing import shutdown_tracing
 
         shutdown_tracing()
+
+        # Put back whatever collector was installed before startup (#3780).
+        reset_metrics_collector(previous_metrics_collector)
 
     from hindsight_api import __version__
     from hindsight_api.config import get_config
@@ -6075,51 +6090,45 @@ def _register_routes(app: FastAPI):
     ):
         """Rename/move a node and/or update a page's options."""
         try:
-            updated: dict[str, Any] | None = None
-            did_change = False
-            if body.name is not None:
-                did_change = True
-                updated = await app.state.memory.rename_knowledge_node(
-                    bank_id=bank_id, node_id=node_id, name=body.name, request_context=request_context
-                )
             # parent_id is applied only when present in the body, so passing null
-            # moves the node to the root (distinct from "not provided").
-            if "parent_id" in body.model_fields_set:
-                did_change = True
-                updated = await app.state.memory.move_knowledge_node(
-                    bank_id=bank_id, node_id=node_id, new_parent_id=body.parent_id, request_context=request_context
-                )
-            # Page options live on the backing mental model; each applies only when
-            # present in the body (so tags=[] clears, distinct from "not provided").
+            # moves the node to the root (distinct from "not provided"), which is
+            # what KEEP_PARENT stands in for. Page options live on the backing
+            # mental model and each applies only when supplied (so tags=[] clears,
+            # distinct from "not provided").
             page_fields = {"source_query", "tags", "max_tokens", "trigger"} & body.model_fields_set
-            if page_fields:
-                did_change = True
-                updated = await app.state.memory.update_knowledge_page(
-                    bank_id=bank_id,
-                    page_id=node_id,
-                    source_query=body.source_query if "source_query" in page_fields else None,
-                    tags=body.tags if "tags" in page_fields else None,
-                    max_tokens=body.max_tokens if "max_tokens" in page_fields else None,
-                    # Only the trigger fields the client stated: the engine patches them over
-                    # the page's current trigger, and a full dump would carry this model's own
-                    # defaults (mode="full", exclude_mental_models=False) into every update.
-                    trigger=(body.trigger.model_dump(exclude_unset=True) if body.trigger else None),
-                    request_context=request_context,
-                )
-                # A new source query means the content is stale — rebuild it.
-                if updated is not None and "source_query" in page_fields and updated.get("mental_model_id"):
-                    await app.state.memory.submit_async_refresh_mental_model(
-                        bank_id=bank_id,
-                        mental_model_id=updated["mental_model_id"],
-                        request_context=request_context,
-                    )
-            if not did_change:
+            if body.name is None and "parent_id" not in body.model_fields_set and not page_fields:
                 raise HTTPException(
                     status_code=400,
                     detail="Provide name, parent_id, source_query, tags, max_tokens, and/or trigger to update",
                 )
+            # One call, one transaction: a rename must not survive the move that
+            # fails after it, which is what left clients retrying against a tree
+            # they never asked for.
+            updated = await app.state.memory.update_knowledge_node(
+                bank_id=bank_id,
+                node_id=node_id,
+                name=body.name,
+                parent_id=body.parent_id if "parent_id" in body.model_fields_set else KEEP_PARENT,
+                source_query=body.source_query if "source_query" in page_fields else None,
+                tags=body.tags if "tags" in page_fields else None,
+                max_tokens=body.max_tokens if "max_tokens" in page_fields else None,
+                # Only the trigger fields the client stated: the engine patches them over
+                # the page's current trigger, and a full dump would carry this model's own
+                # defaults (mode="full", exclude_mental_models=False) into every update.
+                trigger=(body.trigger.model_dump(exclude_unset=True) if body.trigger else None),
+                request_context=request_context,
+            )
             if updated is None:
                 raise HTTPException(status_code=404, detail=f"Knowledge node '{node_id}' not found")
+            # A new source query means the content is stale — rebuild it. Scheduled
+            # only once the patch has committed, so a refresh is never queued for a
+            # change that rolled back.
+            if "source_query" in page_fields and body.source_query is not None and updated.get("mental_model_id"):
+                await app.state.memory.submit_async_refresh_mental_model(
+                    bank_id=bank_id,
+                    mental_model_id=updated["mental_model_id"],
+                    request_context=request_context,
+                )
             return _knowledge_node_model(updated)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -7309,9 +7318,14 @@ def _register_routes(app: FastAPI):
             bank_config = BankTemplateConfig(**filtered_overrides) if filtered_overrides else None
 
             # Get mental models (limit=None — an export that stopped at the
-            # default page size would silently drop the rest of the bank)
+            # default page size would silently drop the rest of the bank).
+            # detail="config" because a template carries how a model is built,
+            # never what it currently says: the loop below reads source_query,
+            # tags, max_tokens and trigger and nothing else. Asking for content
+            # would pull every model's synthesized body across the wire, and
+            # report a read of it, for a field this endpoint discards.
             mental_models_raw = await app.state.memory.list_mental_models(
-                bank_id=bank_id, limit=None, request_context=request_context
+                bank_id=bank_id, limit=None, detail="config", request_context=request_context
             )
             template_mental_models: list[BankTemplateMentalModel] = []
             for mm in mental_models_raw.items:
@@ -7864,6 +7878,13 @@ def _register_routes(app: FastAPI):
         except WebhookURLError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+    def _parse_webhook_id(webhook_id: str) -> uuid.UUID:
+        """Parse a webhook path parameter without turning client input into a 500."""
+        try:
+            return uuid.UUID(webhook_id)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid webhook ID") from None
+
     @app.post(
         "/v1/default/banks/{bank_id}/webhooks",
         response_model=WebhookResponse,
@@ -7918,6 +7939,8 @@ def _register_routes(app: FastAPI):
                 if hasattr(row["updated_at"], "isoformat")
                 else str(row["updated_at"]),
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -7972,6 +7995,8 @@ def _register_routes(app: FastAPI):
                 )
 
             return WebhookListResponse(items=[_parse_webhook_row(row) for row in rows])
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -7999,12 +8024,14 @@ def _register_routes(app: FastAPI):
         try:
             deleted = await app.state.memory.delete_webhook(
                 bank_id,
-                uuid.UUID(webhook_id),
+                _parse_webhook_id(webhook_id),
                 request_context=request_context,
             )
             if not deleted:
                 raise HTTPException(status_code=404, detail="Webhook not found")
             return DeleteResponse(success=True)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -8032,7 +8059,8 @@ def _register_routes(app: FastAPI):
         """Update a webhook's fields (PATCH semantics — only sent fields are updated)."""
         try:
             set_clauses: list[str] = []
-            params: list = [uuid.UUID(webhook_id), bank_id]
+            parsed_webhook_id = _parse_webhook_id(webhook_id)
+            params: list = [parsed_webhook_id, bank_id]
 
             fields = request.model_fields_set
             if "url" in fields:
@@ -8057,7 +8085,7 @@ def _register_routes(app: FastAPI):
 
             row = await app.state.memory.update_webhook(
                 bank_id,
-                uuid.UUID(webhook_id),
+                parsed_webhook_id,
                 set_clauses=set_clauses,
                 params=params,
                 request_context=request_context,
@@ -8089,6 +8117,8 @@ def _register_routes(app: FastAPI):
                 if hasattr(row["updated_at"], "isoformat")
                 else str(row["updated_at"]),
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -8118,7 +8148,7 @@ def _register_routes(app: FastAPI):
             try:
                 rows = await app.state.memory.list_webhook_deliveries(
                     bank_id,
-                    uuid.UUID(webhook_id),
+                    _parse_webhook_id(webhook_id),
                     limit=limit,
                     cursor=cursor,
                     request_context=request_context,
@@ -8137,6 +8167,8 @@ def _register_routes(app: FastAPI):
                 ],
                 next_cursor=next_cursor,
             )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:

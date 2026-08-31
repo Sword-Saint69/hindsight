@@ -16,7 +16,7 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 from ..llm_interface import ProviderContentPolicyError, ProviderRateLimitResetError
-from ..llm_wrapper import LLMConfig, OutputTooLongError, parse_llm_json, sanitize_llm_output
+from ..llm_wrapper import LLMConfig, OutputTooLongError, parse_llm_json, sanitize_llm_output, sanitize_llm_value
 from ..operation_metadata import RetainExtractionErrors
 from ..response_models import TokenUsage
 from ..structured_output import strict_json_schema
@@ -169,6 +169,33 @@ class Fact(BaseModel):
     # Optional structured data
     entities: list[str] | None = None
     causal_relations: list["CausalRelation"] | None = None
+
+    @field_validator("fact")
+    @classmethod
+    def sanitize_fact_text(cls, value: str) -> str:
+        # Structured JSON parsing turns a model's ``\udXXX`` escape into a
+        # surrogate only after raw-output cleanup, so scrub the final text at
+        # the shared immediate/batch extraction boundary before storage or embedding (#3729).
+        # ``LLMProvider.call`` already scrubs the response this is built from; this is the
+        # storage-side guarantee for any text that reaches ``Fact`` by another route.
+        return _sanitize_text(value) or ""
+
+    @field_validator("entities")
+    @classmethod
+    def sanitize_entity_names(cls, value: list[str] | None) -> list[str] | None:
+        # Entity names are model-authored too, and they are not merely metadata: they
+        # are appended to the very string that gets embedded (``augment_texts_with_dates``)
+        # and joined into the ``text_signals`` column feeding BM25. A surrogate in a name
+        # crashes exactly where one in ``fact`` does. Names that sanitize away entirely
+        # are dropped rather than stored blank.
+        if value is None:
+            return None
+        cleaned_names = []
+        for name in value:
+            cleaned = _sanitize_text(name) or ""
+            if cleaned.strip():
+                cleaned_names.append(cleaned)
+        return cleaned_names
 
 
 class CausalRelation(BaseModel):
@@ -815,13 +842,20 @@ def _iter_jsonl_chunks(text: str, max_chars: int, structured_limit: int) -> Iter
 # FACT EXTRACTION PROMPTS
 # =============================================================================
 
+# Retain's wording of the preserve-the-source-language rule; the selection between it
+# and an explicit output language belongs to default_language_section(), which documents
+# the invariant. Without it, fact extraction runs on an all-English prompt and a
+# multilingual model drifts to English (or, per #181, to an unrelated language entirely)
+# on non-English input. Consolidation carries the equivalent rule, making "preserve the
+# source language" the pipeline-wide default.
+_DEFAULT_LANGUAGE_RULE = """LANGUAGE: MANDATORY — Detect the language of the input text and produce ALL output in that EXACT same language. You are STRICTLY FORBIDDEN from translating or switching to any other language. Every single word of your output must be in the same language as the input. Do NOT output in a different language under any circumstance."""
+
+
 # Base prompt template (shared by concise and custom modes)
 # Uses {extraction_guidelines} placeholder for mode-specific instructions
 _BASE_FACT_EXTRACTION_PROMPT = """Extract SIGNIFICANT facts from text. Be SELECTIVE - only extract facts worth remembering long-term.
 
-LANGUAGE: MANDATORY — Detect the language of the input text and produce ALL output in that EXACT same language. You are STRICTLY FORBIDDEN from translating or switching to any other language. Every single word of your output must be in the same language as the input. Do NOT output in a different language under any circumstance.
-
-{retain_mission_section}{extraction_guidelines}
+{language_section}{retain_mission_section}{extraction_guidelines}
 
 ══════════════════════════════════════════════════════════════════════════
 FACT FORMAT - BE CONCISE
@@ -935,6 +969,7 @@ an experience or person."""
 
 # Assembled concise prompt
 CONCISE_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
+    language_section="{language_section}",
     retain_mission_section="{retain_mission_section}",
     extraction_guidelines=_CONCISE_GUIDELINES,
     examples=_CONCISE_EXAMPLES,
@@ -942,6 +977,7 @@ CONCISE_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
 
 # Custom prompt uses same base but without examples
 CUSTOM_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
+    language_section="{language_section}",
     retain_mission_section="{retain_mission_section}",
     extraction_guidelines="{custom_instructions}",
     examples="",  # No examples for custom mode
@@ -963,6 +999,7 @@ RULES:
 - fact_type: use "world" for user preferences, rules, corrections, constraints, traits, and other objective facts, even when stated during an assistant interaction. Use "assistant" only for actions or experiences the assistant/agent actually performed."""
 
 VERBATIM_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
+    language_section="{language_section}",
     retain_mission_section="{retain_mission_section}",
     extraction_guidelines=_VERBATIM_GUIDELINES,
     examples="",
@@ -972,9 +1009,7 @@ VERBATIM_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
 # Verbose extraction prompt - detailed, comprehensive facts (legacy mode)
 VERBOSE_FACT_EXTRACTION_PROMPT = """Extract facts from text into structured format with FIVE required dimensions - BE EXTREMELY DETAILED.
 
-LANGUAGE: MANDATORY — Detect the language of the input text and produce ALL output in that EXACT same language. You are STRICTLY FORBIDDEN from translating or switching to any other language. Every single word of your output must be in the same language as the input. Do NOT output in a different language under any circumstance.
-
-{retain_mission_section}══════════════════════════════════════════════════════════════════════════
+{language_section}{retain_mission_section}══════════════════════════════════════════════════════════════════════════
 FACT FORMAT - ALL FIVE DIMENSIONS REQUIRED - MAXIMUM VERBOSITY
 ══════════════════════════════════════════════════════════════════════════
 
@@ -1215,36 +1250,35 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
     # CachedContent serves every bank, and the mission rides in the per-request
     # user message via _retain_mission_preamble(). The {retain_mission_section}
     # placeholder is kept (templates still reference it) but always empty here.
-    from hindsight_api.engine.prompt_utils import escape_for_prompt
+    from hindsight_api.engine.prompt_utils import default_language_section, escape_for_prompt
 
     retain_mission_section = ""
 
-    # Select base prompt based on extraction mode
-    if extraction_mode == "custom":
-        if not config.retain_custom_instructions:
-            base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
-            prompt = base_prompt.format(
-                retain_mission_section=retain_mission_section,
-            )
-        else:
-            base_prompt = CUSTOM_FACT_EXTRACTION_PROMPT
-            prompt = base_prompt.format(
-                retain_mission_section=retain_mission_section,
-                custom_instructions=escape_for_prompt(config.retain_custom_instructions),
-            )
+    # Mirrors build_consolidation_system_prompt(). This toggle may change the cacheable
+    # prefix — it is low-cardinality and keyed by the cache fingerprint.
+    language_section = default_language_section(_DEFAULT_LANGUAGE_RULE, config.llm_output_language)
+
+    # Select base prompt based on extraction mode. The modes differ in which constant they
+    # name, not in how it is filled: only the custom template references
+    # {custom_instructions}, and ``str.format`` ignores a keyword no template mentions, so
+    # all four can be filled by one call.
+    custom_instructions = ""
+    if extraction_mode == "custom" and config.retain_custom_instructions:
+        base_prompt = CUSTOM_FACT_EXTRACTION_PROMPT
+        custom_instructions = escape_for_prompt(config.retain_custom_instructions)
     elif extraction_mode == "verbose":
-        prompt = VERBOSE_FACT_EXTRACTION_PROMPT.format(
-            retain_mission_section=retain_mission_section,
-        )
+        base_prompt = VERBOSE_FACT_EXTRACTION_PROMPT
     elif extraction_mode == "verbatim":
-        prompt = VERBATIM_FACT_EXTRACTION_PROMPT.format(
-            retain_mission_section=retain_mission_section,
-        )
+        base_prompt = VERBATIM_FACT_EXTRACTION_PROMPT
     else:
+        # Concise is the default, and also what custom mode falls back to with no
+        # instructions configured — there is nothing to substitute into the custom template.
         base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
-        prompt = base_prompt.format(
-            retain_mission_section=retain_mission_section,
-        )
+    prompt = base_prompt.format(
+        language_section=language_section,
+        retain_mission_section=retain_mission_section,
+        custom_instructions=custom_instructions,
+    )
 
     # Add causal relationships section if enabled
     # Verbatim mode never uses causal relations (no fact text to relate causally)
@@ -2363,7 +2397,10 @@ async def extract_facts_from_contents_batch_api(
     logger.info(f"Batch {batch_id} completed in {elapsed:.0f}s, retrieving results")
 
     # Step 4: Retrieve results
-    batch_results = await batch_impl.retrieve_batch_results(batch_id)
+    # Batch results are downloaded straight from the provider's output file, so they
+    # never pass through ``LLMProvider.call`` and miss the scrub it applies. Sanitize
+    # them here so the batch path gets the same guarantee as the sync one (#3729).
+    batch_results = sanitize_llm_value(await batch_impl.retrieve_batch_results(batch_id))
 
     # Map results by custom_id
     results_by_id = {result["custom_id"]: result for result in batch_results}
