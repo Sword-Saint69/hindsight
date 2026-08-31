@@ -13775,24 +13775,18 @@ class MemoryEngine(MemoryEngineInterface):
 
         """
         await self._authenticate_tenant(request_context)
-
-        # Pre-operation validation (credit check / usage metering)
+        # Suppressed under _authorize_nested_operations: export_knowledge_base reads
+        # every page's history under its own single EXPORT_KNOWLEDGE_BASE gate, and
+        # must not bill one read per page on top of it.
         if self._operation_validator and not _nested_operation_authorized.get():
-            from hindsight_api.extensions.operation_validator import MentalModelGetContext
+            from hindsight_api.extensions import BankReadContext, BankReadOperation
 
-            if not self._consume_preauthorized_mental_model_operation(
-                bank_id,
-                mental_model_id,
-                refresh=False,
+            ctx = BankReadContext(
+                bank_id=bank_id,
+                operation=BankReadOperation.GET_MENTAL_MODEL_HISTORY,
                 request_context=request_context,
-            ):
-                ctx = MentalModelGetContext(
-                    bank_id=bank_id,
-                    mental_model_id=mental_model_id,
-                    request_context=request_context,
-                )
-                await self._validate_operation(self._operation_validator.validate_mental_model_get(ctx))
-
+            )
+            await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
         backend = await self._get_backend()
         async with acquire_with_retry(backend) as conn:
             exists = await conn.fetchrow(
@@ -13829,38 +13823,7 @@ class MemoryEngine(MemoryEngineInterface):
                         "changed_at": changed_at.isoformat() if hasattr(changed_at, "isoformat") else changed_at,
                     }
                 )
-
-        # Post-operation hook (usage recording)
-        if result is not None and self._operation_validator and not _nested_operation_authorized.get():
-            try:
-                from hindsight_api.extensions.operation_validator import MentalModelGetResult
-
-                total_content_len = 0
-                for item in result:
-                    for key in ("previous_content", "previous_reflect_response"):
-                        val = item.get(key)
-                        if val is not None:
-                            if isinstance(val, str):
-                                total_content_len += len(val)
-                            elif isinstance(val, (dict, list)):
-                                total_content_len += len(json.dumps(val, default=str))
-                            else:
-                                total_content_len += len(str(val))
-
-                output_tokens = total_content_len // 4 if total_content_len else 0
-
-                result_ctx = MentalModelGetResult(
-                    bank_id=bank_id,
-                    mental_model_id=mental_model_id,
-                    request_context=request_context,
-                    output_tokens=output_tokens,
-                    success=True,
-                )
-                await self._operation_validator.on_mental_model_get_complete(result_ctx)
-            except Exception as hook_err:
-                logger.warning(f"Post-mental-model-get hook error (non-fatal): {hook_err}")
-
-        return result
+            return result
 
     async def _generate_mental_model_embedding(self, name: str, content: str) -> str | None:
         embedding = await embedding_utils.generate_embeddings_batch(self.embeddings, [f"{name} {content}"])
